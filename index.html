@@ -2103,14 +2103,14 @@ scene({
 
 scene({
   id: 'challenge', part: 8, title: 'Design challenge: the dusty crossing', min: 7, min60: 6, min90: 12,
-  visual: 'Mission card on the left with a small schematic of the field (start, target, partly mapped rocks, dust zone). Six design-question cards in a grid; each flips to show one reasonable engineering answer. Below: four complication buttons revealed one at a time. Countdown timer.',
+  visual: 'Mission card on the left with a live mini-simulation of the field (start, target, partly mapped rocks, dust zone): the rover plans, drives, discovers unmapped rocks and reacts to the selected complication. Six design-question cards in a grid; each flips to show one reasonable engineering answer. Below: four complication buttons revealed one at a time. Countdown timer.',
   onScreen: '"Your lunar rover must navigate to a target through a dusty, partially mapped obstacle field. One of its sensors becomes unreliable. What should it do?" Questions: sensors · position · obstacles · planning · execution & monitoring · safe-stop conditions.',
   interaction: 'Instructor starts the timer, reveals complications one at a time, and flips each question card after groups answer.',
   html: `
   <div class="split" style="grid-template-columns:minmax(250px,0.9fr) minmax(0,2fr)">
     <div class="rail">
       <div class="card" style="border-color:var(--blue)"><div class="kicker">Mission</div><p class="lede" style="margin-top:6px">Your lunar rover must reach a target 7 m away through a <b>dusty, partially mapped</b> obstacle field. Partway through, <b>one sensor becomes unreliable</b>. What should it do?</p></div>
-      <div class="viz plain" style="flex:0 0 auto;height:170px;min-height:170px"><div class="cvhost" id="cv"></div></div>
+      <div class="viz plain" style="flex:0 0 auto;height:240px;min-height:240px"><div class="cvhost" id="cv"></div></div>
       <div class="controls"><span class="mono" id="clk" style="font-size:30px">07:00</span><span id="tb"></span></div>
       <p>Answer in trade-offs. "Use AI" is not an answer; "use a camera detector because LiDAR returns are unreliable in dust, accepting lower range accuracy" is.</p>
     </div>
@@ -2139,22 +2139,127 @@ scene({
       ['Unexpected obstacle', 'A rock appears 0.8 m ahead, not in the map, while the global planner is mid-cycle.', 'Local planner / reactive layer stops or swerves immediately; the obstacle is added to the map; global replan from the current pose. The supervisor stops the rover if nothing reacts in time.']
     ];
     const cxo = el.querySelector('#cxo');
-    U.seg(el.querySelector('#cx'), CX.map((c, i) => [String(i), c[0]]), '', v => { const c = CX[+v]; cxo.innerHTML = `<h3>${c[0]}</h3><p style="color:var(--fg)">${c[1]}</p><div class="controls" style="margin-top:8px"></div>`; U.btn(cxo.querySelector('.controls'), 'Show one approach', e => { e.target.parentElement.outerHTML = `<p style="margin-top:8px">${c[2]}</p>`; }); });
-    // field schematic
-    const c = U.canvas(el.querySelector('#cv'), () => { const { ctx, W, H } = c; ctx.clearRect(0, 0, W, H); const T = U.fit(W, H, 8, 4, 10);
-      ctx.fillStyle = U.a(k.amber, 0.12); ctx.beginPath(); ctx.ellipse(T.X(4.2), T.Y(2), 1.6 * T.s, 1.5 * T.s, 0, 0, 7); ctx.fill(); ctx.fillStyle = k.amber; ctx.font = k.mono; ctx.fillText('dust', T.X(3.9), T.Y(3.3));
-      const rk = [[2.6, 1.2, .25, 1], [3.4, 2.9, .3, 1], [4.8, 1.6, .35, 0], [5.6, 2.8, .25, 0], [6.2, 1.0, .2, 1], [4.1, 2.2, .2, 0]];
-      rk.forEach(([x, y, r, kn]) => { ctx.beginPath(); ctx.arc(T.X(x), T.Y(y), r * T.s, 0, 7); if (kn) { ctx.fillStyle = k.fg; ctx.fill(); } else { ctx.setLineDash([3, 3]); ctx.strokeStyle = k.muted; ctx.stroke(); ctx.setLineDash([]); } });
-      U.rover(ctx, T.X(0.7), T.Y(2), 0, 0.5 * T.s, k.cyan, k.bg2); ctx.fillStyle = k.green; ctx.fillRect(T.X(7.4) - 6, T.Y(2) - 6, 12, 12);
-      ctx.fillStyle = k.muted; ctx.fillText('solid: mapped · dashed: unknown', T.X(0.1), T.Y(0.1) - 2); });
+    // field simulation: A* on an inflated cost grid, pure-pursuit driving, and the selected complication applied live
+    const WW = 8, WH = 4, RR = 0.25, G = 0.1, NX = WW / G, NY = WH / G, GOAL = { x: 7.4, y: 2 }, DZ = { x: 4.2, y: 2, rx: 1.6, ry: 1.5 };
+    const BASE = [[2.6, 1.2, .25, 1], [3.4, 2.9, .3, 1], [4.8, 1.6, .35, 0], [5.6, 2.8, .25, 0], [6.2, 1.0, .2, 1], [4.1, 2.2, .2, 0]];
+    const rnd = U.rng(11);
+    let cx = -1, rocks, P, est, path, pi, mode, note, hold, rest, phantoms, encD, trueD, slipSeen, range = 1.5;
+    const inDust = (x, y) => ((x - DZ.x) / DZ.rx) ** 2 + ((y - DZ.y) / DZ.ry) ** 2 < 1;
+    const shadowed = (x, y) => cx === 0 && rocks.some(o => x > o.x && x < o.x + 1.2 && Math.abs(y - o.y) < o.r);
+    function plan() {
+      const blocked = (x, y) => y < RR || y > WH - RR || rocks.some(o => o.known && Math.hypot(x - o.x, y - o.y) < o.r + RR + 0.08);
+      const N = NX * NY, cost = new Float32Array(N);
+      for (let j = 0; j < NY; j++) for (let i = 0; i < NX; i++) {
+        const x = (i + .5) * G, y = (j + .5) * G;
+        cost[j * NX + i] = blocked(x, y) ? Infinity : 1 + (shadowed(x, y) ? 4 : 0) + (cx === 1 && inDust(x, y) ? 1.5 : 0) + (cx === 2 && slipSeen && inDust(x, y) ? 1.5 : 0);
+      }
+      const ci = (x, y) => U.clamp(Math.floor(y / G), 0, NY - 1) * NX + U.clamp(Math.floor(x / G), 0, NX - 1);
+      const s = ci(P.x, P.y), g = ci(GOAL.x, GOAL.y);
+      const gs = new Float32Array(N).fill(Infinity), from = new Int32Array(N).fill(-1), done = new Uint8Array(N);
+      const h = n => Math.hypot(n % NX - g % NX, (n / NX | 0) - (g / NX | 0));
+      const open = [[h(s), s]]; gs[s] = 0;
+      while (open.length) {
+        let bi = 0; for (let q = 1; q < open.length; q++) if (open[q][0] < open[bi][0]) bi = q;
+        const n = open[bi][1]; open[bi] = open[open.length - 1]; open.pop();
+        if (done[n]) continue; done[n] = 1; if (n === g) break;
+        const i = n % NX, j = n / NX | 0;
+        for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+          const a = i + di, b = j + dj; if ((!di && !dj) || a < 0 || b < 0 || a >= NX || b >= NY) continue;
+          const m = b * NX + a; if (done[m] || cost[m] === Infinity) continue;
+          const ng = gs[n] + (di && dj ? Math.SQRT2 : 1) * cost[m];
+          if (ng < gs[m]) { gs[m] = ng; from[m] = n; open.push([ng + h(m), m]); }
+        }
+      }
+      if (!done[g]) { path = null; return; }
+      const pts = []; for (let n = g; n !== -1; n = from[n]) pts.push({ x: (n % NX + .5) * G, y: ((n / NX | 0) + .5) * G });
+      pts.reverse(); pts[0] = { x: P.x, y: P.y }; pts.push(GOAL); path = pts; pi = 0;
+    }
+    const reset = () => {
+      rocks = BASE.map(([x, y, r, kn]) => ({ x, y, r, known: !!kn }));
+      P = { x: 0.7, y: 2, th: 0 }; est = { x: P.x, y: P.y }; mode = 'NOMINAL'; note = ''; hold = 0; rest = 0; phantoms = []; encD = trueD = 0; slipSeen = false;
+      plan();
+    };
+    const spawn = () => {
+      if (!path || mode === 'ARRIVED' || mode === 'SAFE STOP') reset();
+      let d = 0, q = pi; while (q < path.length - 1 && d < 0.8) { d += Math.hypot(path[q + 1].x - path[q].x, path[q + 1].y - path[q].y); q++; }
+      if (Math.hypot(GOAL.x - path[q].x, GOAL.y - path[q].y) < 0.6) { reset(); return spawn(); }
+      rocks.push({ x: path[q].x, y: path[q].y, r: 0.2, known: false, surprise: true });
+    };
+    function step(dt) {
+      if (mode === 'ARRIVED' || mode === 'SAFE STOP') { rest += dt; if (rest > 3) reset(); return; }
+      if (hold > 0) { hold -= dt; return; }
+      const dusty = inDust(P.x, P.y);
+      range = cx === 1 && dusty ? 0.9 : cx === 0 ? 1.0 : 1.5;
+      let seen = false;
+      rocks.forEach(o => { if (!o.known && Math.hypot(o.x - P.x, o.y - P.y) - o.r < range) { o.known = o.fresh = seen = true; if (o.surprise) { hold = 0.8; mode = 'STOPPED'; note = 'unmapped rock ahead: stop, map it, replan'; } } });
+      if (seen) { plan(); if (hold > 0) return; }
+      if (!path) { mode = 'SAFE STOP'; note = 'no safe path: request help'; return; }
+      while (pi < path.length - 1 && Math.hypot(path[pi + 1].x - P.x, path[pi + 1].y - P.y) <= Math.hypot(path[pi].x - P.x, path[pi].y - P.y)) pi++;
+      let ti = pi; while (ti < path.length - 1 && Math.hypot(path[ti].x - P.x, path[ti].y - P.y) < 0.45) ti++;
+      let vmax = 0.6, slip = 0; mode = 'NOMINAL'; note = ''; phantoms = [];
+      if (cx === 0) note = 'camera weight down; shadows costed as unknown';
+      if (cx === 1 && dusty) {
+        mode = 'DEGRADED'; vmax = 0.3; note = 'LiDAR 40% valid; phantoms need persistence';
+        for (let n = 0; n < 14; n++) { const a = rnd() * 2 * Math.PI, d = 0.3 + rnd() * 0.8; phantoms.push({ x: P.x + d * Math.cos(a), y: P.y + d * Math.sin(a) }); }
+      }
+      if (cx === 2) {
+        if (dusty) slip = 0.45;
+        if (slipSeen) { mode = dusty ? 'SLIP DETECTED' : 'NOMINAL'; if (dusty) vmax = 0.3; }
+        if (encD > 0) note = `encoders ${encD.toFixed(1)} m · scan match ${trueD.toFixed(1)} m`;
+      }
+      if (cx === 3 && !rocks.some(o => o.surprise) && P.x > 2) spawn();
+      if (cx === 3 && !note) note = 'local planner reacts; map updated';
+      const err = U.wrap(Math.atan2(path[ti].y - P.y, path[ti].x - P.x) - P.th);
+      P.th = U.wrap(P.th + U.clamp(err, -2.5 * dt, 2.5 * dt));
+      const v = vmax * Math.max(0, Math.cos(err)), c0 = Math.cos(P.th), s0 = Math.sin(P.th);
+      P.x += v * (1 - slip) * c0 * dt; P.y += v * (1 - slip) * s0 * dt;
+      est.x += v * c0 * dt; est.y += v * s0 * dt; // encoders count wheel turns, not ground progress
+      if (slip) { encD += v * dt; trueD += v * (1 - slip) * dt; if (!slipSeen && encD - trueD > 0.25) { slipSeen = true; plan(); } }
+      if (Math.hypot(GOAL.x - P.x, GOAL.y - P.y) < 0.15) { mode = 'ARRIVED'; note = 'target reached'; phantoms = []; }
+    }
+    const c = U.canvas(el.querySelector('#cv'), draw);
+    function draw() {
+      const { ctx, W, H } = c; ctx.clearRect(0, 0, W, H); const T = U.fit(W, H - 36, WW, WH, 4);
+      const mc = { NOMINAL: k.green, ARRIVED: k.green, DEGRADED: k.amber, 'SLIP DETECTED': k.amber, STOPPED: k.red, 'SAFE STOP': k.red }[mode];
+      ctx.font = k.monoB; ctx.textBaseline = 'middle'; ctx.fillStyle = mc; ctx.fillText(mode, 10, 10);
+      ctx.font = k.mono; ctx.fillStyle = k.muted; ctx.fillText(note, 10 + ctx.measureText(mode).width + 12, 10);
+      ctx.save(); ctx.translate(0, 20);
+      ctx.strokeStyle = k.line; ctx.strokeRect(T.X(0), T.Y(WH), WW * T.s, WH * T.s);
+      ctx.fillStyle = U.a(k.amber, cx === 1 || cx === 2 ? 0.2 : 0.12); ctx.beginPath(); ctx.ellipse(T.X(DZ.x), T.Y(DZ.y), DZ.rx * T.s, DZ.ry * T.s, 0, 0, 7); ctx.fill();
+      ctx.fillStyle = k.amber; ctx.textBaseline = 'alphabetic'; ctx.textAlign = 'center'; ctx.fillText(cx === 2 ? 'dust · loose regolith' : 'dust', T.X(DZ.x), T.Y(DZ.y - DZ.ry) + 13); ctx.textAlign = 'left';
+      if (cx === 0) { ctx.fillStyle = 'rgba(0,0,0,0.38)'; rocks.forEach(o => ctx.fillRect(T.X(o.x), T.Y(o.y + o.r), 1.2 * T.s, 2 * o.r * T.s)); }
+      if (path) { ctx.strokeStyle = U.a(k.cyan, 0.6); ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(T.X(P.x), T.Y(P.y)); for (let q = pi + 1; q < path.length; q++) ctx.lineTo(T.X(path[q].x), T.Y(path[q].y)); ctx.stroke(); ctx.setLineDash([]); }
+      rocks.forEach(o => { ctx.beginPath(); ctx.arc(T.X(o.x), T.Y(o.y), o.r * T.s, 0, 7);
+        if (o.known) { ctx.fillStyle = k.fg; ctx.fill(); if (o.fresh) { ctx.strokeStyle = k.amber; ctx.lineWidth = 2; ctx.stroke(); ctx.lineWidth = 1; } }
+        else { ctx.setLineDash([3, 3]); ctx.strokeStyle = k.muted; ctx.stroke(); ctx.setLineDash([]); } });
+      ctx.fillStyle = k.red; phantoms.forEach(p => ctx.fillRect(T.X(p.x) - 1.5, T.Y(p.y) - 1.5, 3, 3));
+      ctx.strokeStyle = U.a(k.cyan, 0.25); ctx.beginPath(); ctx.arc(T.X(P.x), T.Y(P.y), range * T.s, 0, 7); ctx.stroke();
+      if (cx === 2 && encD > 0) { ctx.strokeStyle = k.red; ctx.setLineDash([3, 3]); ctx.beginPath(); ctx.arc(T.X(est.x), T.Y(est.y), RR * T.s, 0, 7); ctx.stroke(); ctx.setLineDash([]); ctx.fillStyle = k.red; ctx.fillText('encoders', T.X(est.x) - 22, T.Y(est.y) - RR * T.s - 4); }
+      ctx.fillStyle = k.green; ctx.fillRect(T.X(GOAL.x) - 6, T.Y(GOAL.y) - 6, 12, 12);
+      U.rover(ctx, T.X(P.x), T.Y(P.y), P.th, 2 * RR * T.s, k.cyan, k.bg2);
+      ctx.restore();
+      ctx.fillStyle = k.muted; ctx.textBaseline = 'middle'; ctx.fillText('solid: mapped · dashed: unknown · ring: sensing range', 10, H - 8);
+    }
+    reset();
+    const seg = U.seg(el.querySelector('#cx'), CX.map((c, i) => [String(i), c[0]]), '', v => {
+      const cc = CX[+v]; cxo.innerHTML = `<h3>${cc[0]}</h3><p style="color:var(--fg)">${cc[1]}</p><div class="controls" style="margin-top:8px"></div>`; U.btn(cxo.querySelector('.controls'), 'Show one approach', e => { e.target.parentElement.outerHTML = `<p style="margin-top:8px">${cc[2]}</p>`; });
+      cx = +v; est = { x: P.x, y: P.y }; encD = trueD = 0; slipSeen = false; phantoms = [];
+      if (cx === 3) spawn(); if (mode !== 'ARRIVED' && mode !== 'SAFE STOP') plan(); if (U.RM) { for (let n = 0; n < 300 && mode !== 'ARRIVED'; n++) step(0.05); } draw();
+    });
+    U.btn(el.querySelector('#cx'), 'Clear', () => { seg.set('', false); cx = -1; cxo.innerHTML = '<p>Reveal a complication when groups have a first architecture.</p>'; reset(); draw(); });
+    const loop = U.RM ? null : U.loop(dt => { step(dt); draw(); });
     // timer
     let left = 7 * 60, on = false, iv = null; const clk = el.querySelector('#clk');
     const fmt = () => { clk.textContent = String(Math.floor(left / 60)).padStart(2, '0') + ':' + String(left % 60).padStart(2, '0'); clk.className = 'mono ' + (left <= 60 ? 'c-red' : ''); };
     const tb = el.querySelector('#tb'); let sb;
-    sb = U.btn(tb, 'Start', () => { on = !on; sb.textContent = on ? 'Pause' : 'Resume'; if (on && !iv) iv = setInterval(() => { if (on && left > 0) { left--; fmt(); } }, 1000); }, 'primary');
+    sb = U.btn(tb, 'Start', () => {
+      if (left <= 0) left = 7 * 60;
+      on = !on; sb.textContent = on ? 'Pause' : 'Resume'; fmt();
+      if (on && !iv) iv = setInterval(() => { if (!on) return; left = Math.max(0, left - 1); fmt(); if (!left) { on = false; sb.textContent = 'Restart'; } }, 1000);
+    }, 'primary');
     U.btn(tb, 'Reset', () => { left = 7 * 60; on = false; sb.textContent = 'Start'; fmt(); });
     fmt();
-    return () => { if (iv) clearInterval(iv); c.destroy(); };
+    return () => { if (iv) clearInterval(iv); if (loop) loop(); c.destroy(); };
   },
   notes: {
     objective: 'Students apply every part of the loop to one realistic scenario and justify choices as trade-offs.',
